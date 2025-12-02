@@ -1,0 +1,7 @@
+__pycache__
+*.pyc
+.git
+.venv
+.env
+trump_posts_db.json
+trump_feed_parser.log

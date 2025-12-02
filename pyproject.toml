@@ -16,10 +16,7 @@ dependencies = [
     "tinydb (>=4.8.2,<5.0.0)",
     "python-telegram-bot (>=22.0,<23.0)",
     "pytz (>=2025.2,<2026.0)",
-    "torch (>=2.7.0,<3.0.0)",
-    "transformers (>=4.51.3,<5.0.0)",
     "bs4 (>=0.0.2,<0.0.3)",
-    "ollama (>=0.5.1,<0.6.0)",
     "google-genai (>=1.0.0)",
 ]
 
