@@ -12,14 +12,14 @@ from datetime import datetime
 import datetime as dt
 from typing import List, Dict
 
-import feedparser
 import pytz
 from tinydb import TinyDB, Query
-from telegram import Bot
+from telegram import Bot, InputMediaPhoto
+from telegram.request import HTTPXRequest
 from telegram.error import RetryAfter
 import re
+import requests
 from bs4 import BeautifulSoup
-from urllib.parse import urlparse
 
 from feed_fetcher import safe_fetch_feed
 from llm_summarize_v4_finance import TrumpFeedAnalyzer
@@ -54,26 +54,22 @@ def format_summary_for_telegram(summary: str) -> str:
     try:
         # Parse HTML
         soup = BeautifulSoup(summary, 'html.parser')
-        
+
         # Find all links
-        has_links = False
         for link in soup.find_all('a'):
             href = link.get('href', '')
             if href:
-                has_links = True
                 # Replace the link with a Telegram-friendly format
                 link.replace_with(f'<a href="{href}">{href}</a>')
-        
+
         # Get clean text without other HTML tags
         clean_text = soup.get_text().strip()
-        
+
         # Remove multiple spaces and newlines
         clean_text = re.sub(r'\s+', ' ', clean_text)
-        
-        # if has_links:
-            # return clean_text
+
         return clean_text
-            
+
     except Exception as e:
         logger.error(f'Error formatting summary for Telegram: {e}')
         # Return a cleaned version of the original text as fallback
@@ -85,9 +81,11 @@ async def send_telegram_notification(post: dict, analysis: dict) -> bool:
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         logger.warning('Telegram credentials not configured')
         return False
-    
-    bot = Bot(token=TELEGRAM_TOKEN)
-    
+
+    # Configure request with longer timeouts for image uploads
+    t_request = HTTPXRequest(connection_pool_size=8, connect_timeout=60.0, read_timeout=60.0, write_timeout=60.0)
+    bot = Bot(token=TELEGRAM_TOKEN, request=t_request)
+
     # Extract analysis data
     headline = analysis.get('headline', 'New Post')
     summary_text = analysis.get('summary', '')
@@ -107,60 +105,147 @@ async def send_telegram_notification(post: dict, analysis: dict) -> bool:
     message_parts = [header, "", f"{summary_text}", ""]
 
     # Add Financial Impact Section if relevant
-    if is_relevant:
+    if is_relevant and relevance_score > 0:
         sentiment = market_impact.get('sentiment', 'NEUTRAL')
         sentiment_emoji = "🐂" if sentiment == "BULLISH" else "🐻" if sentiment == "BEARISH" else "😐"
-        
+
         signal = market_impact.get('signal', 'N/A')
         tickers = market_impact.get('tickers', [])
         sectors = market_impact.get('sectors', [])
-        
+
         impact_section = [
             "📉 <b>Market Impact</b>",
             f"<b>Signal:</b> {signal}",
             f"<b>Sentiment:</b> {sentiment} {sentiment_emoji}",
             f"<b>Score:</b> {relevance_score}/10"
         ]
-        
+
         if tickers:
             impact_section.append(f"<b>Tickers:</b> {', '.join(tickers)}")
         if sectors:
             impact_section.append(f"<b>Sectors:</b> {', '.join(sectors)}")
-            
+
         message_parts.extend(impact_section)
         message_parts.append("") # Spacer
 
     # Footer
+    ts_url = post.get('truth_social_url', post['link'])
+    likes = post.get('likes', 0)
+    retruths = post.get('retruths', 0)
+    
+    stats_line = ""
+    if likes > 0 or retruths > 0:
+        stats_line = f"❤️ {likes:,}  🔁 {retruths:,}\n"
+
     footer = (
+        f'{stats_line}'
         f'Published: {to_hr_format(post["published"])}\n'
-        f'<a href="{post["link"]}">Read original post</a>'
+        f'<a href="{ts_url}">Read original post</a>'
     )
     message_parts.append(footer)
-    
+
     final_message = "\n".join(message_parts)
-    
+
+    # Handle Images
+    images = post.get('images', [])
+
     max_retries = 3
     retry_count = 0
     
     while retry_count < max_retries:
         try:
             async with bot:
-                # Send to chat
-                await bot.send_message(
-                    chat_id=TELEGRAM_CHAT_ID,
-                    text=final_message,
-                    parse_mode='HTML',
-                    disable_web_page_preview=True,
-                )
-
-                # Send to channel
-                if TELEGRAM_CHANNEL_ID:
+                # If we have images, send them
+                if images:
+                    # Check if caption fits
+                    caption_fits = len(final_message) <= 1024
+                    
+                    if len(images) == 1:
+                        # Single Image
+                        if caption_fits:
+                            await bot.send_photo(
+                                chat_id=TELEGRAM_CHAT_ID,
+                                photo=images[0],
+                                caption=final_message,
+                                parse_mode='HTML'
+                            )
+                            if TELEGRAM_CHANNEL_ID:
+                                await bot.send_photo(
+                                    chat_id=TELEGRAM_CHANNEL_ID,
+                                    photo=images[0],
+                                    caption=final_message,
+                                    parse_mode='HTML'
+                                )
+                        else:
+                            # Send photo then text
+                            await bot.send_photo(chat_id=TELEGRAM_CHAT_ID, photo=images[0])
+                            await bot.send_message(
+                                chat_id=TELEGRAM_CHAT_ID,
+                                text=final_message,
+                                parse_mode='HTML',
+                                disable_web_page_preview=True,
+                            )
+                            if TELEGRAM_CHANNEL_ID:
+                                await bot.send_photo(chat_id=TELEGRAM_CHANNEL_ID, photo=images[0])
+                                await bot.send_message(
+                                    chat_id=TELEGRAM_CHANNEL_ID,
+                                    text=final_message,
+                                    parse_mode='HTML',
+                                    disable_web_page_preview=True,
+                                )
+                    else:
+                        # Multiple Images (Media Group)
+                        # Telegram limits media groups to 10 items
+                        media_group = []
+                        for idx, img_url in enumerate(images[:10]):
+                            if idx == 0 and caption_fits:
+                                media_group.append(InputMediaPhoto(media=img_url, caption=final_message, parse_mode='HTML'))
+                            else:
+                                media_group.append(InputMediaPhoto(media=img_url))
+                        
+                        await bot.send_media_group(chat_id=TELEGRAM_CHAT_ID, media=media_group)
+                        if TELEGRAM_CHANNEL_ID:
+                            # Re-create media group for the second send to avoid any potential issues with reused input objects
+                            media_group_channel = []
+                            for idx, img_url in enumerate(images[:10]):
+                                if idx == 0 and caption_fits:
+                                    media_group_channel.append(InputMediaPhoto(media=img_url, caption=final_message, parse_mode='HTML'))
+                                else:
+                                    media_group_channel.append(InputMediaPhoto(media=img_url))
+                            await bot.send_media_group(chat_id=TELEGRAM_CHANNEL_ID, media=media_group_channel)
+                            
+                        # If caption didn't fit, send it as a separate message
+                        if not caption_fits:
+                            await bot.send_message(
+                                chat_id=TELEGRAM_CHAT_ID,
+                                text=final_message,
+                                parse_mode='HTML',
+                                disable_web_page_preview=True,
+                            )
+                            if TELEGRAM_CHANNEL_ID:
+                                await bot.send_message(
+                                    chat_id=TELEGRAM_CHANNEL_ID,
+                                    text=final_message,
+                                    parse_mode='HTML',
+                                    disable_web_page_preview=True,
+                                )
+                else:
+                    # Send text only
                     await bot.send_message(
-                        chat_id=TELEGRAM_CHANNEL_ID,
+                        chat_id=TELEGRAM_CHAT_ID,
                         text=final_message,
                         parse_mode='HTML',
                         disable_web_page_preview=True,
                     )
+
+                    # Send to channel
+                    if TELEGRAM_CHANNEL_ID:
+                        await bot.send_message(
+                            chat_id=TELEGRAM_CHANNEL_ID,
+                            text=final_message,
+                            parse_mode='HTML',
+                            disable_web_page_preview=True,
+                        )
             return True
             
         except RetryAfter as e:
@@ -177,9 +262,81 @@ async def send_telegram_notification(post: dict, analysis: dict) -> bool:
     return False
 
 
+def get_truth_social_data(trumpstruth_url: str) -> Dict:
+    """
+    Fetches additional data from Truth Social via trumpstruth.org link.
+    Returns a dict with: text, images (list), likes (int), retruths (int).
+    """
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+    }
+    
+    result = {
+        'text': None,
+        'images': [],
+        'likes': 0,
+        'retruths': 0,
+        'truth_social_url': None
+    }
+    
+    try:
+        # 1. Get the Truth Social Link from Trumpstruth.org
+        resp = requests.get(trumpstruth_url, headers=headers, timeout=10)
+        if resp.status_code != 200:
+            logger.warning(f"Failed to fetch {trumpstruth_url}: {resp.status_code}")
+            return result
+            
+        soup = BeautifulSoup(resp.content, 'html.parser')
+        external_link = soup.find('a', class_='status__external-link')
+        
+        if not external_link:
+            logger.warning(f"No external link found on {trumpstruth_url}")
+            return result
+            
+        truth_social_url = external_link.get('href')
+        result['truth_social_url'] = truth_social_url
+        
+        # 2. Extract ID and call API
+        # URL format: https://truthsocial.com/@realDonaldTrump/115656343773820545
+        match = re.search(r'/(\d+)$', truth_social_url)
+        if not match:
+            logger.warning(f"Could not extract ID from {truth_social_url}")
+            return result
+            
+        post_id = match.group(1)
+        api_url = f"https://truthsocial.com/api/v1/statuses/{post_id}"
+        
+        api_resp = requests.get(api_url, headers=headers, timeout=10)
+        if api_resp.status_code != 200:
+            logger.warning(f"Failed to fetch API {api_url}: {api_resp.status_code}")
+            return result
+            
+        data = api_resp.json()
+        
+        # 3. Parse Data
+        result['likes'] = data.get('favourites_count', 0)
+        result['retruths'] = data.get('reblogs_count', 0)
+        
+        # Clean HTML content for text
+        raw_content = data.get('content', '')
+        if raw_content:
+            result['text'] = format_summary_for_telegram(raw_content)
+            
+        # Extract Images
+        media_attachments = data.get('media_attachments', [])
+        for media in media_attachments:
+            if media.get('type') == 'image' and media.get('url'):
+                result['images'].append(media.get('url'))
+                
+    except Exception as e:
+        logger.error(f"Error fetching Truth Social data: {e}")
+        
+    return result
+
+
 def fetch_feed(url: str) -> List[Dict]:
     # Using safe fetch method (returns None on failure)
-    entries = safe_fetch_feed(url)
+    entries = safe_fetch_feed(url)[:5]
 
     return entries
 
@@ -257,14 +414,28 @@ async def process_new_posts(entries: List[Dict], analyzer: TrumpFeedAnalyzer) ->
     processed_count = 0
     
     for i, post in enumerate(new_posts_to_process):
+        # Enrich post with Truth Social data (Images, Stats, Full Text)
+        ts_data = get_truth_social_data(post['link'])
+        
+        # Update post with enriched data
+        if ts_data['text']:
+            post['full_text'] = ts_data['text']
+        if ts_data['images']:
+            post['images'] = ts_data['images']
+        post['likes'] = ts_data['likes']
+        post['retruths'] = ts_data['retruths']
+        post['truth_social_url'] = ts_data['truth_social_url'] or post['link']
+
         # Safe Lookup using the index 'i' which corresponds to 'post_id'
         analysis = analysis_map.get(i)
         
         if not analysis:
             logger.error(f"Analysis result missing for post index {i} (ID: {post['id']})")
+            # Use enriched text if available, else summary
+            text_for_summary = post.get('full_text') or format_summary_for_telegram(post['summary'])
             analysis = {
                 "headline": "New Post (Analysis Failed)",
-                "summary": format_summary_for_telegram(post['summary']),
+                "summary": text_for_summary,
                 "is_financial_relevant": False,
                 "relevance_score": 0
             }
