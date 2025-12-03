@@ -336,7 +336,7 @@ def get_truth_social_data(trumpstruth_url: str) -> Dict:
 
 def fetch_feed(url: str) -> List[Dict]:
     # Using safe fetch method (returns None on failure)
-    entries = safe_fetch_feed(url)[:5]
+    entries = safe_fetch_feed(url)
 
     return entries
 
