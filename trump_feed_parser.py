@@ -471,9 +471,7 @@ async def main():
     logger.info('Trump Truth RSS Feed Parser started')
     while True:
         try:
-            logger.info('Fetching feed...')
             posts = fetch_feed(FEED_URL)
-            logger.info(f'Fetched {len(posts)} posts.')
             new_posts = await process_new_posts(posts, analyzer)
             logger.info(f'Processed {new_posts} new posts out of {len(posts)} total posts.')
         except Exception as e:
