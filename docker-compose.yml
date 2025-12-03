@@ -7,5 +7,15 @@ services:
       - .env
     environment:
       - DB_PATH=/app/data/${DB_FILENAME:-trump_posts_db.json}
+      - LOG_PATH=/app/logs/${LOG_FILENAME:-trump_feed_parser.log}
+      - HTTPS_PROXY=http://trojan-proxy:1087
+      - HTTP_PROXY=http://trojan-proxy:1087
+    networks:
+      - proxy_net
     volumes:
       - ./data:/app/data
+      - ./logs:/app/logs
+
+networks:
+  proxy_net:
+    external: true

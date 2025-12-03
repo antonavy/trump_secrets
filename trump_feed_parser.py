@@ -20,17 +20,19 @@ import re
 from bs4 import BeautifulSoup
 from urllib.parse import urlparse
 
-# from summarize_feed_intel import main as summarize_text
 from feed_fetcher import safe_fetch_feed
 from llm_summarize_v4_finance import TrumpFeedAnalyzer
 
 
 # Configure logging
 logging.basicConfig(
-    filename='trump_feed_parser.log',
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
-    datefmt='%Y-%m-%d %H:%M:%S'
+    datefmt='%Y-%m-%d %H:%M:%S',
+    handlers=[
+        logging.FileHandler(os.getenv('LOG_PATH', 'trump_feed_parser.log')),
+        logging.StreamHandler()
+    ]
 )
 logger = logging.getLogger(__name__)
 

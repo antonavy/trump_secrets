@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+*.ipynb
+.env
+.venv/
+trump_posts_db.json
+trump_feed_parser.log
+poetry.lock
+setup_env
+data/
+logs/
