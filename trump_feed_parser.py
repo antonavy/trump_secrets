@@ -16,6 +16,7 @@ import feedparser
 import pytz
 from tinydb import TinyDB, Query
 from telegram import Bot
+from telegram.error import RetryAfter
 import re
 from bs4 import BeautifulSoup
 from urllib.parse import urlparse
@@ -138,24 +139,42 @@ async def send_telegram_notification(post: dict, analysis: dict) -> bool:
     
     final_message = "\n".join(message_parts)
     
-    async with bot:
-        # Send to chat
-        await bot.send_message(
-            chat_id=TELEGRAM_CHAT_ID,
-            text=final_message,
-            parse_mode='HTML',
-            disable_web_page_preview=True,
-        )
+    max_retries = 3
+    retry_count = 0
+    
+    while retry_count < max_retries:
+        try:
+            async with bot:
+                # Send to chat
+                await bot.send_message(
+                    chat_id=TELEGRAM_CHAT_ID,
+                    text=final_message,
+                    parse_mode='HTML',
+                    disable_web_page_preview=True,
+                )
 
-        # Send to channel
-        if TELEGRAM_CHANNEL_ID:
-            await bot.send_message(
-                chat_id=TELEGRAM_CHANNEL_ID,
-                text=final_message,
-                parse_mode='HTML',
-                disable_web_page_preview=True,
-            )
-    return True
+                # Send to channel
+                if TELEGRAM_CHANNEL_ID:
+                    await bot.send_message(
+                        chat_id=TELEGRAM_CHANNEL_ID,
+                        text=final_message,
+                        parse_mode='HTML',
+                        disable_web_page_preview=True,
+                    )
+            return True
+            
+        except RetryAfter as e:
+            retry_count += 1
+            wait_time = e.retry_after + 1  # Add 1 second buffer
+            logger.warning(f"Telegram Flood Control: Sleeping for {wait_time} seconds. Retry {retry_count}/{max_retries}")
+            await asyncio.sleep(wait_time)
+            
+        except Exception as e:
+            logger.error(f"Failed to send Telegram notification: {e}")
+            return False
+            
+    logger.error(f"Failed to send Telegram notification after {max_retries} retries")
+    return False
 
 
 def fetch_feed(url: str) -> List[Dict]:
@@ -259,6 +278,9 @@ async def process_new_posts(entries: List[Dict], analyzer: TrumpFeedAnalyzer) ->
             await send_telegram_notification(post, analysis)
         
         processed_count += 1
+        
+        # Rate limiting buffer: Sleep 2 seconds between posts to avoid hitting Telegram limits
+        await asyncio.sleep(2)
 
     return processed_count
 
